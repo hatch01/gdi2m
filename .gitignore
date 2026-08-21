@@ -1,0 +1,76 @@
+# --- what this repo tracks -------------------------------------------------
+# Source only: train/, tools/, export/ scripts.
+# Datasets, checkpoints, tensorboard runs, build outputs and exported graphs
+# are all reproducible from those and stay out.
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+
+# C++ / CMake / Ninja build trees
+build/
+build-static/
+out/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+*.obj
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.exp
+.ninja_deps
+.ninja_log
+
+# Model artifacts and training output
+checkpoints/
+runs/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.npz
+*.npy
+export/gdi2m.json
+# the analysis constants, written beside the graph by export_onnx.py and
+# only valid with it - reproducible from the same command, like the graph
+export/*_front.bin
+
+# Datasets and caches (GOAT lives at F:\datasets\GOAT, but keep the guard)
+datasets/
+cache_*/
+norm_stats*.json
+
+# Audio / MIDI / transcription scratch
+*.wav
+*.flac
+*.mp3
+*.aif
+*.aiff
+*.mid
+*.gp
+*.gp3
+*.gp4
+*.gp5
+*.tsv
+*.log
+
+# Reference repo kept beside this one; it has its own .git and its own history
+/neural-guitar-stylization/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
