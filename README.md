@@ -1,7 +1,7 @@
 # Real-time guitar DI to MIDI
 
 ![The panel](app_screencap.jpeg)
-
+### Demo: https://www.youtube.com/watch?v=a9WX4D3oi4o
 A custom causal architecture that translates the full guitar range polyphonically, one output frame per 5.33 ms at 24 kHz, with ~9 ms delay. The repo contains all PyTorch training scripts and an inference app with WASAPI capture and MIDI out.
 
 ### Installation (Windows only):
