@@ -5,7 +5,7 @@
 A custom causal architecture that translates the full guitar range polyphonically, one output frame per 5.33 ms at 24 kHz, with ~9 ms delay. The repo contains all PyTorch training scripts and an inference app with WASAPI capture and MIDI out.
 
 ### Installation (Windows only):
-- Download `gdi2m_ui.exe` from the [Releases](../../releases) page. It is one file: the model, the ONNX Runtime and the C runtime are all inside it.
+- Download `gdi2m_ui.exe` from the [Releases](../../releases) page.
 - Install [loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html) and create a port.
 - Run the exe, pick the capture device and the loopMIDI port, click start. MIDI events will be streamed to the port, so your DAW sees it as it would any MIDI keyboard.
 
@@ -28,7 +28,3 @@ Instead of predicting per-string pitch, we predict onset and sustain over 53 pit
 
 ### Data
 Three datasets feed into one window composer: GOAT, GuitarSet and Guitar-TECHS. 545 recordings, ~10 hours, 180 855 notes, with diverse augmentation techniques.
-
-### License
-
-MIT - see [LICENSE](LICENSE).
