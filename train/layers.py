@@ -35,19 +35,31 @@ class ModuleCache(nn.Module):
 
 
 class CausalConv1d(nn.Module):
+    """`causal=False` centres the time padding: a kernel of k at dilation d
+    reads {t-(k-1)d/2 ... t+(k-1)d/2} instead of {t-(k-1)d ... t}. k is odd
+    everywhere here, so the split is exact.
+    """
+
     def __init__(self, in_channels, out_channels, kernel_size, dilation=1,
-                 groups=1, bias=True):
+                 groups=1, bias=True, causal=True):
         super().__init__()
         self.in_channels = in_channels
+        self.causal = causal
         self.pad = (kernel_size - 1) * dilation
+        assert causal or self.pad % 2 == 0, \
+            "non-causal padding must split evenly; use an odd kernel"
         self.conv = nn.Conv1d(in_channels, out_channels, kernel_size,
                               dilation=dilation, padding=0, groups=groups, bias=bias)
         self.cache = None
 
     def init_cache(self, device=None):
+        assert self.causal, "a non-causal conv has no streaming cache"
         self.cache = torch.zeros(1, self.in_channels, self.pad, device=device)
 
     def forward(self, x):
+        if not self.causal:
+            h = self.pad // 2
+            return self.conv(F.pad(x, (h, h)))
         if self.cache is None or self.training:
             x = F.pad(x, (self.pad, 0))
         else:
@@ -61,24 +73,36 @@ class CausalConv2d(nn.Module):
 
     Frequency is not a causal axis - a harmonic above the fundamental is not
     "the future" - so only the time edge is cached.
+
+    `causal=False` centres the time padding too; frequency is unchanged. With
+    `cfg.time_kernel = 5` that is the whole trunk conversion of the offline
+    twin (model.py).
     """
 
-    def __init__(self, in_channels, out_channels, kernel_size, bias=True, time_dilation=1):
+    def __init__(self, in_channels, out_channels, kernel_size, bias=True,
+                 time_dilation=1, causal=True):
         super().__init__()
         self.in_channels = in_channels
+        self.causal = causal
         self.time_pad = (kernel_size[1] - 1) * time_dilation
         self.freq_pad = kernel_size[0] // 2
+        assert causal or self.time_pad % 2 == 0, \
+            "non-causal time padding must split evenly; use an odd time kernel"
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size,
                               padding=0, bias=bias, dilation=(1, time_dilation))
         self.cache = None
         self.feature_height = None
 
     def init_cache(self, device=None):
+        assert self.causal, "a non-causal conv has no streaming cache"
         assert self.feature_height is not None, "run one forward pass before init_cache"
         self.cache = torch.zeros(1, self.in_channels, self.feature_height,
                                  self.time_pad, device=device)
 
     def forward(self, x):
+        if not self.causal:
+            h = self.time_pad // 2
+            return self.conv(F.pad(x, (h, h, self.freq_pad, self.freq_pad)))
         if self.cache is None or self.training:
             self.feature_height = x.shape[2]
             x = F.pad(x, (self.time_pad, 0, self.freq_pad, self.freq_pad))
@@ -121,15 +145,17 @@ class ResBlock2d(nn.Module):
     """
 
     def __init__(self, in_channels, out_channels, kernel_size, time_dilations=(1, 1),
-                 mixer=None):
+                 mixer=None, causal=True):
         super().__init__()
         mid = max(out_channels, in_channels)
         if mid > 128:
             mid //= 2
         self.norm1 = ChannelRMSNorm(in_channels)
         self.norm2 = ChannelRMSNorm(mid)
-        self.conv1 = CausalConv2d(in_channels, mid, kernel_size, time_dilation=time_dilations[0])
-        self.conv2 = CausalConv2d(mid, out_channels, kernel_size, time_dilation=time_dilations[1])
+        self.conv1 = CausalConv2d(in_channels, mid, kernel_size,
+                                  time_dilation=time_dilations[0], causal=causal)
+        self.conv2 = CausalConv2d(mid, out_channels, kernel_size,
+                                  time_dilation=time_dilations[1], causal=causal)
         self.mixer = mixer(mid) if mixer is not None else None
         self.skip = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels \
             else nn.Identity()
@@ -423,11 +449,15 @@ class StreamingGRU(nn.Module):
     `h0_std` perturbs the initial state during training only - a live session
     runs far longer than a training window, so random starts force tolerance
     of off-manifold state. Eval/streaming still start from exact zeros.
+
+    `reverse=True` runs the same cell over flipped time, so y[t] summarizes
+    t..T-1. No streaming state; `reset` refuses.
     """
 
-    def __init__(self, dim, rows, dropout=0.1, h0_std=0.1):
+    def __init__(self, dim, rows, dropout=0.1, h0_std=0.1, reverse=False):
         super().__init__()
         self.rows = rows
+        self.reverse = reverse
         self.rnn = nn.GRU(dim, dim, 1, batch_first=True)
         # nn.GRU's own dropout arg is a no-op with num_layers=1
         self.drop = nn.Dropout(dropout)
@@ -436,6 +466,8 @@ class StreamingGRU(nn.Module):
         self.h = ModuleCache((1, rows, dim))
 
     def reset(self, device=None):
+        assert not self.reverse, \
+            "a backward GRU has no streaming state - it reads the sequence end first"
         self.h.init_cache(device)
 
     def forward(self, x):
@@ -445,8 +477,9 @@ class StreamingGRU(nn.Module):
         # T is the dynamic axis at export and baking it in would freeze the
         # graph to whatever length the tracer happened to see.
         z = x.permute(0, 2, 3, 1).reshape(N * R, -1, C)
-
-        streaming = (not self.training) and self.h.cache is not None
+        if self.reverse:
+            z = torch.flip(z, dims=(1,))
+        streaming = (not self.training) and self.h.cache is not None and not self.reverse
         if streaming:
             h0 = self.h.cache
         elif self.training and self.h0_std > 0:
@@ -456,6 +489,8 @@ class StreamingGRU(nn.Module):
         y, h = self.rnn(z, h0)
         if streaming:
             self.h.cache = h
+        if self.reverse:
+            y = torch.flip(y, dims=(1,))
         return self.drop(y).reshape(N, R, -1, C).permute(0, 3, 1, 2)
 
 
@@ -467,6 +502,8 @@ def stream_reset(model, device=None, warmup=None):
     that runs one if the model has not been used yet.
     """
     model.eval()
+    if not getattr(getattr(model, "cfg", None), "causal", True):
+        raise RuntimeError("non-causal model: no streaming path, score it offline")
     if warmup is not None:
         with torch.no_grad():
             warmup()

@@ -39,6 +39,24 @@ own row, debounced at decode time.
 Time is never downsampled and no layer looks forward, so the network adds no
 lookahead on top of the hop - framing and transient-visibility delay are
 separate budget items (see spectrogram.py).
+
+`cfg.causal = False` builds the offline twin: the same model with future
+context, for measuring what causality costs. Two things change -
+
+    the trunk    time kernels go 3 -> 5 with centred padding. Causal k=3 at
+                 dilation d reads {t-2d, t-d, t}; centred k=5 reads
+                 {t-2d .. t+2d}, so the backward reach is identical frame for
+                 frame and mirrored forward. (A centred k=3 would have halved
+                 the past to buy the future - a second change.)
+    the memory   a second GRU cell over reversed time, as a parallel branch
+                 off the same features with its own gate. With that gate at 0
+                 the twin IS the causal model, which is what makes an exact
+                 warm start possible (offline_init.py).
+
+Time is still never downsampled: anything that would improve the twin in a
+way the causal model could also have been improved belongs in both or
+neither. There is no streaming path (`stream_reset` refuses) and no export;
+the twin is scored offline and never shipped.
 """
 
 import torch
@@ -59,7 +77,8 @@ class GuitarTranscriber(nn.Module):
         super().__init__()
         self.cfg = cfg
         dim = cfg.dim
-        ks = (3, 3)
+        ks = (3, cfg.time_kernel)      # (frequency, time); frequency is centred either way
+        causal = cfg.causal
 
         self.spec = LogSpectrogram(cfg)
         self.level = LevelFrontend(cfg)
@@ -84,7 +103,8 @@ class GuitarTranscriber(nn.Module):
             # each row gets its own overtone series as channels before any conv runs; see HarmonicStack
             self.harmonics = HarmonicStack(cfg.n_bins, cfg.harmonic_offsets,
                                            cfg.spec_bins)
-            self.up_conv = CausalConv2d(cfg.in_channels, dim, kernel_size=ks)
+            self.up_conv = CausalConv2d(cfg.in_channels, dim, kernel_size=ks,
+                                        causal=causal)
 
             # two res blocks per level (second with dilated time kernels): four
             # levels plus stem give 67 frames (~357 ms) of conv memory, before
@@ -111,9 +131,9 @@ class GuitarTranscriber(nn.Module):
             stack, rows = [], cfg.n_bins
             for c_lvl, c_next in widths:
                 stack += [
-                    ResBlock2d(c_lvl, c_lvl, ks),
+                    ResBlock2d(c_lvl, c_lvl, ks, causal=causal),
                     ResBlock2d(c_lvl, c_lvl, ks, time_dilations=(2, 4),
-                               mixer=mixer_for(rows)),
+                               mixer=mixer_for(rows), causal=causal),
                 ]
                 # whole-channel dropout at deep levels only (rows <= 64), where per-guitar timbre condenses
                 if rows <= 64 and cfg.conv_dropout > 0:
@@ -143,7 +163,7 @@ class GuitarTranscriber(nn.Module):
             # Cross-row mixing survives via the interval mixers below,
             # global_ctx above, and `mix` downstream.
             self.proj_in = CausalConv1d(dim * 8 * h_bottom, cfg.bottleneck_dim, 1,
-                                        groups=h_bottom)
+                                        groups=h_bottom, causal=causal)
         else:
             # conv1d: every (stft channel, bin) is an input channel, so
             # absolute frequency is free but translation equivariance is gone
@@ -181,6 +201,16 @@ class GuitarTranscriber(nn.Module):
         # shared across rows for the same reason the cell is
         self.rnn_gate = nn.Parameter(
             torch.full((1, cfg.pitch_dim, 1, 1), cfg.rnn_gate_init))
+        # twin only: a second cell over reversed time as a parallel branch with
+        # its own gate, not bidirectional=True - the forward path stays
+        # bit-identical to the causal model, and the two gates train separately
+        # so their ratio reads how much future context the task wants
+        self.rnn_bwd = None
+        if not cfg.causal:
+            self.rnn_bwd = StreamingGRU(cfg.pitch_dim, cfg.n_pitches,
+                                        dropout=cfg.rnn_dropout, reverse=True)
+            self.rnn_gate_bwd = nn.Parameter(
+                torch.full((1, cfg.pitch_dim, 1, 1), cfg.rnn_gate_bwd_init))
 
         # both logits off the same per-pitch vector, weights shared across pitches
         self.head = nn.Conv2d(cfg.pitch_dim, 2, 1)
@@ -278,6 +308,10 @@ class GuitarTranscriber(nn.Module):
         # state can drag the output. Gate starts small, so training begins
         # near acoustics-only and buys recurrence per channel only where it pays.
         h = self.rnn(p) * self.rnn_gate + p            # (N, pitch_dim, P, T)
+        if self.rnn_bwd is not None:
+            # reads `p`, not `h`: both directions are branches off the same
+            # features, so zeroing this gate recovers the causal model exactly
+            h = h + self.rnn_bwd(p) * self.rnn_gate_bwd
 
         logits = self.head(h)                          # (N, 2, P, T)
         return {
@@ -298,7 +332,11 @@ class GuitarTranscriber(nn.Module):
         stays a pure function of tensors, so its self-test can run on
         hand-built tensors.
         """
-        return self.rnn_gate.abs().mean()
+        if self.rnn_bwd is None:
+            return self.rnn_gate.abs().mean()
+        # sum, not average: averaging would halve the L1 on the forward gate
+        # relative to the causal run, pricing it differently in the two models
+        return self.rnn_gate.abs().mean() + self.rnn_gate_bwd.abs().mean()
 
     # -- streaming ---------------------------------------------------------
     def start_session(self, device=None):

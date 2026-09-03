@@ -52,6 +52,11 @@ class Config:
     # ---- trunk -----------------------------------------------------------
     # conv2d: weight-shared 2D convs over (freq, time). conv1d (grouped TCN, bins as channels) was A/B'd
     # and retired — fit train better, generalized worse (position-specific weights memorize).
+    # causal=False is the offline twin (see model.py): centred time kernels,
+    # a backward GRU branch, no streaming path. time_kernel 5 keeps the causal
+    # model's backward reach frame for frame and mirrors it forward.
+    causal: bool = True
+    time_kernel: int = 3
     trunk: str = "conv2d"
     dim: int = 32                # conv2d channel width; halving is ~4x less conv work
     trunk1d_width: int = 512     # retired conv1d shape, kept for revival
@@ -79,6 +84,9 @@ class Config:
     # learned gate on the GRU branch (h = x + gate * rnn(x)), one weight per pitch_dim channel shared across
     # rows, so it can't become a per-pitch memory switch. Starts near-closed.
     rnn_gate_init: float = 0.1
+    # the twin's backward-branch gate; 0.0 so a warm-started twin starts
+    # bit-identical to the causal model (offline_init.py)
+    rnn_gate_bwd_init: float = 0.0
 
     # ---- label and decoder timing, in MILLISECONDS -----------------------
     # stated in wall-clock, not frames, and converted with frames_for() — a frame-denominated constant
@@ -136,6 +144,10 @@ class Config:
 
     def __post_init__(self):
         assert self.n_bins % 32 == 0, "n_bins must survive 5 halvings"
+        assert self.time_kernel % 2 == 1, "centred padding needs an odd time kernel"
+        assert self.causal or self.time_kernel >= 3, "a non-causal trunk needs time_kernel >= 3"
+        assert not self.causal or self.time_kernel == 3, \
+            "the shipping causal model is time_kernel 3; changing it changes the conv memory"
         assert self.n_harmonics >= 1, "n_harmonics 1 means no stacking, not 0"
         assert self.f_min * 2.0 ** (self.spec_bins / self.bins_per_octave) \
             <= self.sample_rate - self.alias_guard_hz + 1.0, \
