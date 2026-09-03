@@ -4,6 +4,7 @@
 ### Demo: https://www.youtube.com/watch?v=a9WX4D3oi4o
 A custom causal architecture that translates the full guitar range polyphonically, one output frame per 5.33 ms at 24 kHz, with ~9 ms delay. The repo contains all PyTorch training scripts and an inference app with WASAPI capture and MIDI out.
 
+Paper (preprint): [Measuring the Price of Causality in Low-Latency Polyphonic Guitar Transcription](gdi2m_paper.pdf)
 ### Installation (Windows only):
 - Download `gdi2m_ui.exe` from the [Releases](../../releases) page.
 - Install [loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html) and create a port.
@@ -22,7 +23,7 @@ The static build wants an ONNX Runtime built from source (no prebuilt static rel
 
 ### Model architecture
 
-24 kHz audio, note events out, ~2.6 M parameters, 9.5 MB.
+24 kHz audio, note events out, ~2.2 M parameters, 9.5 MB.
 Two causal STFTs share one hop and one constant-Q grid: a 2048 window for pitch resolution on the low strings and a 512 window for onset timing. Features are fed into a causal 2D CNN with cross-band interaction. A single GRU shared between all pitch rows behind a learned gate at the end.
 Instead of predicting per-string pitch, we predict onset and sustain over 53 pitch rows, which allows for very aggressive data augmentation.
 
