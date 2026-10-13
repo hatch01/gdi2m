@@ -10,12 +10,19 @@
 // except the ORT session's own worker pool, owned entirely by the session.
 #pragma once
 
+// The Windows build wants winmm for MIDI out and the narrow/wide helpers; the
+// Linux build takes its MIDI from ALSA (alsa_midi.h) and its path helper from
+// platform.h. Nothing else below is OS-specific.
+#ifdef _WIN32
 // NOMINMAX before windows.h: it defines min/max as macros, which turns every
 // std::min( in this file into a syntax error.
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <mmsystem.h>
+#else
+#include "alsa_midi.h"
+#endif
 
 #include <onnxruntime_cxx_api.h>
 
@@ -38,6 +45,7 @@ namespace gdi2m {
 
 // -- small helpers ---------------------------------------------------------
 
+#ifdef _WIN32
 inline std::string utf8(const wchar_t* w) {
     if (!w || !*w) return {};
     int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
@@ -52,6 +60,11 @@ inline std::wstring widen(const std::string& s) {
     MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
     return w;
 }
+#else
+// ORTCHAR_T is char here, so widening is the identity - the one caller
+// (Transcriber::load) then names a path the same way on both OSes.
+inline std::string widen(const std::string& s) { return s; }
+#endif
 
 inline const char* kNoteNames[12] = {"C", "C#", "D", "D#", "E", "F", "F#", "G",
                               "G#", "A", "A#", "B"};
@@ -267,13 +280,18 @@ inline bool writeWavFloat(const std::string& path, const std::vector<float>& x, 
     return static_cast<bool>(f);
 }
 
-// -- MIDI out (winmm) ------------------------------------------------------
+// -- MIDI out --------------------------------------------------------------
+//
+// Windows speaks winmm; Linux speaks the ALSA sequencer (alsa_midi.h, pulled
+// in at the top of this file). Only device enumeration and the wire writes
+// differ - the port-selection policy below is shared.
 
 inline std::string lower(std::string s) {
     for (char& c : s) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
     return s;
 }
 
+#ifdef _WIN32
 inline std::vector<std::string> midiPortNames() {
     std::vector<std::string> names;
     UINT n = midiOutGetNumDevs();
@@ -284,6 +302,7 @@ inline std::vector<std::string> midiPortNames() {
     }
     return names;
 }
+#endif
 
 inline bool isBuiltInSynth(const std::string& name) {
     const std::string n = lower(name);
@@ -317,6 +336,7 @@ inline int resolvePort(const char* spec, const std::vector<std::string>& names) 
     return found;
 }
 
+#ifdef _WIN32
 class MidiOut {
 public:
     bool open(int index) {
@@ -353,6 +373,7 @@ public:
 private:
     HMIDIOUT h_ = nullptr;
 };
+#endif  // _WIN32
 
 // -- standard MIDI file ----------------------------------------------------
 
@@ -1003,12 +1024,20 @@ private:
 // -- commands --------------------------------------------------------------
 
 inline std::string defaultModel() {
-    char exe[MAX_PATH]{};
-    GetModuleFileNameA(nullptr, exe, MAX_PATH);
-    std::string dir(exe);
-    size_t slash = dir.find_last_of("\\/");
-    dir = slash == std::string::npos ? "." : dir.substr(0, slash);
+    // Explicit override wins everywhere - a session that names its graph must
+    // not depend on where the binary happens to sit.
+    if (const char* env = std::getenv("GDI2M_MODEL")) return env;
+    const std::string dir = executableDir();
+#ifdef _WIN32
+    // A dev build lives in tools/gdi2m/build, three levels under the export/.
     return dir + "\\..\\..\\..\\export\\gdi2m.onnx";
+#else
+    // Installed layout: <prefix>/bin/gdi2m -> <prefix>/share/gdi2m/gdi2m.onnx.
+    // A build-tree binary instead falls back to export/ under the CWD.
+    if (dir.find("/bin") != std::string::npos)
+        return dir + "/../share/gdi2m/gdi2m.onnx";
+    return "export/gdi2m.onnx";
+#endif
 }
 
 }  // namespace gdi2m

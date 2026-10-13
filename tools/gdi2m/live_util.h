@@ -8,44 +8,28 @@
 
 #pragma once
 
-#define NOMINMAX
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <avrt.h>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <vector>
 
+// The clock (nowHns / hnsToMs), the hop event and the thread-priority helpers
+// live in platform.h; what remains here is pure and identical on every OS.
+#include "platform.h"
+
 namespace gdi2m {
 
-// -- clock -----------------------------------------------------------------
-
-// Everything is stamped in 100 ns units (hns), matching what WASAPI hands
-// back in IAudioCaptureClient::GetBuffer's QPC position.
-inline int64_t qpcFreq() {
-    static const int64_t f = [] {
-        LARGE_INTEGER v{};
-        QueryPerformanceFrequency(&v);
-        return v.QuadPart;
-    }();
-    return f;
+// Case-folding for the device/port substring matches. Shared by the ALSA
+// helpers; gdi2m_core.h's `lower` is the same rule on the MIDI side.
+inline std::string asciiLower(std::string s) {
+    for (char& c : s)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
 }
-
-inline int64_t nowHns() {
-    LARGE_INTEGER v{};
-    QueryPerformanceCounter(&v);
-    // Split the divide instead of scaling first: QPC counts from boot, and on
-    // a machine up for weeks `counter * 10^7` overflows int64 outright.
-    const int64_t f = qpcFreq();
-    return (v.QuadPart / f) * 10000000 + (v.QuadPart % f) * 10000000 / f;
-}
-
-inline double hnsToMs(int64_t hns) { return static_cast<double>(hns) * 1e-4; }
 
 // -- single-producer / single-consumer hop queue ---------------------------
 
@@ -281,105 +265,6 @@ private:
     std::atomic<double> peak_{0.0};
     std::atomic<uint64_t> count_{0};
     std::array<std::atomic<uint64_t>, kBuckets> bucket_{};
-};
-
-// -- core class ------------------------------------------------------------
-
-// WHICH HALF OF A HYBRID CPU a thread runs on is worth more than anything in
-// the model - measured 3.79 ms/frame on a P-core vs 8.46 on an E-core (i9-14900K),
-// decided entirely by the scheduler if nothing pins it. An unpinned thread
-// drifts between them over a long run, showing up as inference mean slowly
-// climbing while every other counter looks healthy. MMCSS "Pro Audio" doesn't
-// fix this - priority decides WHEN a thread runs, not on which core.
-//
-// Asked for as a CPU SET PREFERENCE, not an affinity mask: an affinity mask
-// says "these processors and nothing else" and would rather wait than run
-// elsewhere, where a preference leaves the scheduler free to place the thread
-// when the fast half is busy - late on an E-core still beats not running.
-//
-// One efficiency class means a homogeneous CPU, where this deliberately does
-// nothing: there's no fast half to prefer.
-class PerformanceCores {
-public:
-    static const PerformanceCores& get() {
-        static const PerformanceCores instance;
-        return instance;
-    }
-
-    // False on a homogeneous CPU, where apply() is a no-op that reports success.
-    bool hybrid() const { return hybrid_; }
-    size_t fast() const { return ids_.size(); }
-    size_t total() const { return total_; }
-
-    // False only when the machine is hybrid and the ask was refused.
-    bool apply(HANDLE thread = GetCurrentThread()) const {
-        if (!hybrid_) return true;
-        return SetThreadSelectedCpuSets(thread, ids_.data(),
-                                        static_cast<ULONG>(ids_.size())) != 0;
-    }
-
-private:
-    PerformanceCores() {
-        ULONG bytes = 0;
-        GetSystemCpuSetInformation(nullptr, 0, &bytes, GetCurrentProcess(), 0);
-        if (bytes == 0) return;
-        std::vector<uint8_t> buf(bytes);
-        auto* first = reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buf.data());
-        if (!GetSystemCpuSetInformation(first, bytes, &bytes, GetCurrentProcess(), 0))
-            return;
-
-        // Walked by the Size each record DECLARES, never by sizeof() - the
-        // struct is versioned and later Windows may hand back longer ones.
-        // Higher EfficiencyClass means the more performant core; the name reads backwards.
-        BYTE best = 0, worst = 0xff;
-        for (int pass = 0; pass < 2; ++pass) {
-            for (ULONG off = 0; off + sizeof(SYSTEM_CPU_SET_INFORMATION) <= bytes;) {
-                auto* r = reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buf.data() + off);
-                if (r->Size == 0) break;
-                if (r->Type == CpuSetInformation) {
-                    if (pass == 0) {
-                        ++total_;
-                        best = (std::max)(best, r->CpuSet.EfficiencyClass);
-                        worst = (std::min)(worst, r->CpuSet.EfficiencyClass);
-                    } else if (r->CpuSet.EfficiencyClass == best) {
-                        ids_.push_back(r->CpuSet.Id);
-                    }
-                }
-                off += r->Size;
-            }
-            if (pass == 0 && (total_ == 0 || best == worst)) return;   // homogeneous
-        }
-        hybrid_ = !ids_.empty();
-    }
-
-    std::vector<ULONG> ids_;
-    size_t total_ = 0;
-    bool hybrid_ = false;
-};
-
-// -- thread priority -------------------------------------------------------
-
-// MMCSS. Without this the scheduler treats the thread like any other console
-// process and sets the frame-time tail, not the model.
-//
-// The core-class preference is folded in here rather than left as a second
-// call at each site, since every pro-audio thread wants both and a second call is easy to forget.
-class ProAudioThread {
-public:
-    explicit ProAudioThread(const wchar_t* task = L"Pro Audio") {
-        DWORD idx = 0;
-        h_ = AvSetMmThreadCharacteristicsW(task, &idx);
-        fast_ = PerformanceCores::get().apply();
-    }
-    ~ProAudioThread() {
-        if (h_) AvRevertMmThreadCharacteristics(h_);
-    }
-    bool ok() const { return h_ != nullptr; }
-    bool onFastCores() const { return fast_; }
-
-private:
-    HANDLE h_ = nullptr;
-    bool fast_ = true;
 };
 
 }  // namespace gdi2m

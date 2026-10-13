@@ -22,6 +22,7 @@
 #include "live_engine.h"
 
 #include <chrono>
+#include <csignal>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
@@ -73,8 +74,13 @@ int cmdBench(int argc, char** argv) {
               std::to_string(cores.total()) + " - preferred"
             : std::string("HYBRID CPU, PREFERENCE REFUSED");
     std::printf("cores     %s\n", where.c_str());
+#ifdef _WIN32
     std::printf("mmcss     %s\n\n", prio.ok() ? "Pro Audio"
         : "NOT GRANTED - the tail below is the scheduler\'s, not the model\'s");
+#else
+    std::printf("rt        %s\n\n", prio.ok() ? "SCHED_FIFO"
+        : "NOT GRANTED - the tail below is the scheduler\'s, not the model\'s");
+#endif
 
     std::vector<float> hop(static_cast<size_t>(m.hop()));
     for (size_t i = 0; i < hop.size(); ++i)
@@ -301,8 +307,10 @@ int cmdFile(int argc, char** argv) {
 // -- live ------------------------------------------------------------------
 
 // Ctrl-C handler runs on its own thread; it may only flip a flag for other
-// threads to poll - unwinding WASAPI here would race the capture thread inside GetBuffer.
+// threads to poll - unwinding the audio backend here would race the capture
+// thread inside GetBuffer/readi.
 std::atomic<bool> g_stop{false};
+#ifdef _WIN32
 BOOL WINAPI ctrlHandler(DWORD type) {
     if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_CLOSE_EVENT) {
         g_stop.store(true);
@@ -310,6 +318,9 @@ BOOL WINAPI ctrlHandler(DWORD type) {
     }
     return FALSE;
 }
+#else
+void ctrlHandler(int) { g_stop.store(true); }
+#endif
 
 // argv -> LiveOptions - the whole of what `live` decides; the panel fills the
 // same struct, so a session means the same thing from either front end.
@@ -509,7 +520,12 @@ int cmdLive(int argc, char** argv) {
     const float gain = opt.gain;
 
     // ---- console ----------------------------------------------------------
+#ifdef _WIN32
     SetConsoleCtrlHandler(ctrlHandler, TRUE);
+#else
+    std::signal(SIGINT, ctrlHandler);
+    std::signal(SIGTERM, ctrlHandler);
+#endif
     uint64_t lastNotes = 0;
     int64_t lastPrint = eng.startHns;
     while (!g_stop.load(std::memory_order_relaxed)) {
@@ -559,7 +575,9 @@ int cmdLive(int argc, char** argv) {
 
     // ---- shutdown ---------------------------------------------------------
     eng.finish();
+#ifdef _WIN32
     SetConsoleCtrlHandler(ctrlHandler, FALSE);
+#endif
 
     const double elapsed = eng.elapsed;
     const int64_t frames = eng.frameCount.load();
@@ -657,8 +675,14 @@ int cmdLive(int argc, char** argv) {
                     "  ...warmup", eng.infWarm.mean(), eng.infWarm.max(),
                     static_cast<unsigned long long>(eng.infWarm.count()));
     if (!eng.proAudioOk.load())
+#ifdef _WIN32
         std::printf("  NOTE: MMCSS 'Pro Audio' was NOT granted on the inference thread, so\n"
                     "        the frame-time tail below is the scheduler's, not the model's.\n");
+#else
+        std::printf("  NOTE: real-time scheduling (SCHED_FIFO) was NOT granted on the inference\n"
+                    "        thread (needs CAP_SYS_NICE / an rtprio rlimit), so the frame-time\n"
+                    "        tail below is the scheduler's, not the model's.\n");
+#endif
     if (!eng.fastCoresOk.load())
         std::printf("  NOTE: this is a HYBRID CPU and the performance-core preference was\n"
                     "        REFUSED on the inference thread. Measured cost of running on\n"
@@ -1126,16 +1150,21 @@ void usage() {
 }  // namespace
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
+#endif
     if (argc < 2) { usage(); return 2; }
     const std::string cmd = argv[1];
 
     // MTA on the main thread - the capture thread shares these interfaces,
     // and an apartment mismatch shows up as a marshalling failure deep
-    // inside Activate, far from the cause.
+    // inside Activate, far from the cause. COM is a Windows thing; ALSA needs
+    // no apartment setup.
+#ifdef _WIN32
     const bool needsCom = (cmd == "live");
     HRESULT co = S_OK;
     if (needsCom) co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+#endif
 
     int rc = 2;
     try {
@@ -1148,6 +1177,8 @@ int main(int argc, char** argv) {
         std::cerr << "onnxruntime: " << e.what() << "\n";
         rc = 1;
     }
+#ifdef _WIN32
     if (needsCom && SUCCEEDED(co)) CoUninitialize();
+#endif
     return rc;
 }

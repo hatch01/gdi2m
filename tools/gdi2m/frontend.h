@@ -20,10 +20,6 @@
 // quietly transcribing a different signal than training saw.
 #pragma once
 
-#define NOMINMAX
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-
 #include <algorithm>
 #include <cmath>
 #include <cstdint>

@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.20)
-project(gdi2m VERSION 0.1.0 LANGUAGES CXX RC)
+# RC (the resource compiler for the panel's icon and embedded model) only
+# exists on Windows; the Linux build is the console tool alone.
+if(WIN32)
+    project(gdi2m VERSION 0.1.0 LANGUAGES CXX RC)
+else()
+    project(gdi2m VERSION 0.1.0 LANGUAGES CXX)
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -13,6 +19,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(GDI2M_EMBED "Embed the exported model into gdi2m_ui.exe" ON)
 set(GDI2M_EXPORT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../export"
     CACHE PATH "Where export_onnx.py wrote gdi2m.onnx and its sidecars")
+
+if(WIN32)
 
 # -- ONNX Runtime ------------------------------------------------------------
 #
@@ -237,3 +245,35 @@ endforeach()
 # header of ui_main.cpp. shell32/comdlg32: the WAV picker and the settings
 # path. Both ship with Windows; nothing here is vendored.
 target_link_libraries(gdi2m_ui PRIVATE d2d1 dwrite shell32 comdlg32)
+
+else()  # not WIN32 - Linux
+
+# -- the console tool only ---------------------------------------------------
+#
+# The panel is Direct2D; there is no Direct2D off Windows, so only gdi2m.exe's
+# twin is built here. It is the same main.cpp / live_engine.h / gdi2m_core.h as
+# Windows - the OS seam (wasapi_capture.h -> alsa_capture.h, sine_out.h ->
+# alsa_out.h, winmm -> alsa_midi.h) is chosen in audio_io.h at compile time.
+#
+# ONNX Runtime and ALSA come from the system via pkg-config: the flake and the
+# nixpkgs derivation put onnxruntime.dev and alsa-lib on the include/lib path.
+# libonnxruntime.pc points includedir at .../include/onnxruntime, which is
+# exactly where <onnxruntime_cxx_api.h> lives.
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(ORT REQUIRED IMPORTED_TARGET libonnxruntime)
+pkg_check_modules(ALSA REQUIRED IMPORTED_TARGET alsa)
+
+set(GDI2M_HEADERS
+    gdi2m_core.h frontend.h live_engine.h resampler.h live_util.h platform.h
+    audio_io.h alsa_capture.h alsa_out.h alsa_midi.h)
+
+add_executable(gdi2m main.cpp ${GDI2M_HEADERS})
+target_include_directories(gdi2m PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+# pthread: the capture/render/inference threads. dl: ONNX Runtime dlopens its
+# execution providers.
+target_link_libraries(gdi2m PRIVATE PkgConfig::ORT PkgConfig::ALSA pthread dl)
+target_compile_options(gdi2m PRIVATE -O2 -Wall -Wextra)
+
+install(TARGETS gdi2m RUNTIME DESTINATION bin)
+
+endif()

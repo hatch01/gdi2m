@@ -17,8 +17,10 @@
 
 #include "gdi2m_core.h"
 #include "resampler.h"
-#include "sine_out.h"
-#include "wasapi_capture.h"
+// The device seam: WASAPI on Windows, ALSA on Linux. Both expose the same
+// WasapiCapture/SineOut surface (see audio_io.h), so nothing below is
+// per-OS and the console tool and panel drive one pipeline.
+#include "audio_io.h"
 
 #include <chrono>
 #include <thread>
@@ -213,7 +215,7 @@ struct LiveInfo {
 struct LiveFeed {
     Resampler rs;
     HopQueue q;
-    HANDLE hopReady = nullptr;
+    AutoResetEvent hopReady;
 
     // What the model was handed, in training's units: p90 of 50 ms RMS,
     // post-resample and post-gain. See ActiveLevel.
@@ -241,12 +243,10 @@ struct LiveFeed {
         rsOut.assign(rs.maxOutputFor(maxPacket_), 0.0f);
         stage.assign(static_cast<size_t>(hop), 0.0f);
         q.init(hop, queueHops);
-        hopReady = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (!hopReady) { err = "CreateEvent failed"; return false; }
         return true;
     }
 
-    ~LiveFeed() { if (hopReady) CloseHandle(hopReady); }
+    ~LiveFeed() = default;
 
     // One packet of mono input at inRate, stamped with the capture time of its
     // FIRST sample. Runs on the capture thread: no allocation, no lock, no I/O.
@@ -286,7 +286,7 @@ struct LiveFeed {
     void push(int64_t stamp) {
         if (q.push(stage.data(), stamp)) {
             hopsPushed.fetch_add(1, std::memory_order_relaxed);
-            SetEvent(hopReady);
+            hopReady.set();
             return;
         }
         // A device can't wait (the packet is gone regardless), so count the
@@ -300,7 +300,7 @@ struct LiveFeed {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             if (q.push(stage.data(), stamp)) {
                 hopsPushed.fetch_add(1, std::memory_order_relaxed);
-                SetEvent(hopReady);
+                hopReady.set();
                 return;
             }
         }
@@ -602,7 +602,7 @@ public:
                 }, err)) {
                 stop_.store(true);
                 inferDone_.store(true, std::memory_order_release);
-                SetEvent(feed.hopReady);
+                feed.hopReady.set();
                 if (infer_.joinable()) infer_.join();
                 cap.close();
                 midi.close();
@@ -629,7 +629,7 @@ public:
         if (!running_) return;
         stop_.store(true);
         inferDone_.store(true, std::memory_order_release);
-        SetEvent(feed.hopReady);
+        feed.hopReady.set();
         if (!opt_.fromFile) cap.stop();
         sine.stop();
         if (source_.joinable()) source_.join();
@@ -749,7 +749,7 @@ private:
             off += k;
         }
         inferDone_.store(true, std::memory_order_release);
-        SetEvent(feed.hopReady);
+        feed.hopReady.set();
     }
 
     void inferLoop() {
@@ -778,7 +778,7 @@ private:
         while (!stop_.load(std::memory_order_relaxed)) {
             if (!feed.q.pop(hopBuf.data(), stamp)) {
                 if (inferDone_.load(std::memory_order_acquire)) break;
-                WaitForSingleObject(feed.hopReady, 20);
+                feed.hopReady.wait(20);
                 continue;
             }
             maxDepth.store(std::max(maxDepth.load(std::memory_order_relaxed),
